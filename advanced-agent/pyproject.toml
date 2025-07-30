@@ -1,14 +1,16 @@
 [project]
-name = "advanced-agent"
+name = "contract-analyzer"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-powered Contract Analyzer & Negotiation Advisor"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
-    "firecrawl-py>=2.16.2",
     "langchain>=0.3.27",
     "langchain-openai>=0.3.28",
     "langgraph>=0.6.0",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
+    "pymupdf>=1.23.0",
+    "regex>=2023.0.0",
+
 ]

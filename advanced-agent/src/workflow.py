@@ -2,148 +2,161 @@ from typing import Dict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from .models import ResearchState, CompanyInfo, CompanyAnalysis
-from .firecrawl import FirecrawlService
-from .prompts import DeveloperToolsPrompts
+import json
+from .models import ContractState, ClauseAnalysis, ContractReport
+from .pdf_loader import PDFLoader
+from .clause_splitter import ClauseSplitter
+from .prompts import ContractAnalysisPrompts
 
 
-class Workflow:
+class ContractAnalysisWorkflow:
     def __init__(self):
-        self.firecrawl = FirecrawlService()
+        self.pdf_loader = PDFLoader()
+        self.clause_splitter = ClauseSplitter()
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-        self.prompts = DeveloperToolsPrompts()
+        self.prompts = ContractAnalysisPrompts()
         self.workflow = self._build_workflow()
 
     def _build_workflow(self):
-        graph = StateGraph(ResearchState)
-        graph.add_node("extract_tools", self._extract_tools_step)
-        graph.add_node("research", self._research_step)
-        graph.add_node("analyze", self._analyze_step)
-        graph.set_entry_point("extract_tools")
-        graph.add_edge("extract_tools", "research")
-        graph.add_edge("research", "analyze")
-        graph.add_edge("analyze", END)
+        graph = StateGraph(ContractState)
+        graph.add_node("load_contract", self._load_contract_step)
+        graph.add_node("split_clauses", self._split_clauses_step)
+        graph.add_node("analyze_clauses", self._analyze_clauses_step)
+        graph.add_node("generate_report", self._generate_report_step)
+        
+        graph.set_entry_point("load_contract")
+        graph.add_edge("load_contract", "split_clauses")
+        graph.add_edge("split_clauses", "analyze_clauses")
+        graph.add_edge("analyze_clauses", "generate_report")
+        graph.add_edge("generate_report", END)
+        
         return graph.compile()
 
-    def _extract_tools_step(self, state: ResearchState) -> Dict[str, Any]:
-        print(f"🔍 Finding articles about: {state.query}")
-
-        article_query = f"{state.query} tools comparison best alternatives"
-        search_results = self.firecrawl.search_companies(article_query, num_results=3)
-
-        all_content = ""
-        for result in search_results.data:
-            url = result.get("url", "")
-            scraped = self.firecrawl.scrape_company_pages(url)
-            if scraped:
-                all_content + scraped.markdown[:1500] + "\n\n"
-
-        messages = [
-            SystemMessage(content=self.prompts.TOOL_EXTRACTION_SYSTEM),
-            HumanMessage(content=self.prompts.tool_extraction_user(state.query, all_content))
-        ]
-
-        try:
-            response = self.llm.invoke(messages)
-            tool_names = [
-                name.strip()
-                for name in response.content.strip().split("\n")
-                if name.strip()
-            ]
-            print(f"Extracted tools: {', '.join(tool_names[:5])}")
-            return {"extracted_tools": tool_names}
-        except Exception as e:
-            print(e)
-            return {"extracted_tools": []}
-
-    def _analyze_company_content(self, company_name: str, content: str) -> CompanyAnalysis:
-        structured_llm = self.llm.with_structured_output(CompanyAnalysis)
-
-        messages = [
-            SystemMessage(content=self.prompts.TOOL_ANALYSIS_SYSTEM),
-            HumanMessage(content=self.prompts.tool_analysis_user(company_name, content))
-        ]
-
-        try:
-            analysis = structured_llm.invoke(messages)
-            return analysis
-        except Exception as e:
-            print(e)
-            return CompanyAnalysis(
-                pricing_model="Unknown",
-                is_open_source=None,
-                tech_stack=[],
-                description="Failed",
-                api_available=None,
-                language_support=[],
-                integration_capabilities=[],
-            )
-
-
-    def _research_step(self, state: ResearchState) -> Dict[str, Any]:
-        extracted_tools = getattr(state, "extracted_tools", [])
-
-        if not extracted_tools:
-            print("⚠️ No extracted tools found, falling back to direct search")
-            search_results = self.firecrawl.search_companies(state.query, num_results=4)
-            tool_names = [
-                result.get("metadata", {}).get("title", "Unknown")
-                for result in search_results.data
-            ]
+    def _load_contract_step(self, state: ContractState) -> Dict[str, Any]:
+        """Load contract from file (PDF or text)"""
+        print("📄 Loading contract file...")
+        
+        # This will be set by the caller
+        if not hasattr(state, 'file_path'):
+            raise ValueError("file_path must be provided in state")
+        
+        file_path = state.file_path
+        
+        # Determine file type and load accordingly
+        if file_path.lower().endswith('.pdf'):
+            contract_text = self.pdf_loader.load_pdf(file_path)
         else:
-            tool_names = extracted_tools[:4]
+            contract_text = self.pdf_loader.load_text_file(file_path)
+        
+        if not contract_text:
+            raise ValueError(f"Failed to load contract from {file_path}")
+        
+        print(f"✅ Loaded contract ({len(contract_text)} characters)")
+        return {"contract_text": contract_text}
 
-        print(f"🔬 Researching specific tools: {', '.join(tool_names)}")
+    def _split_clauses_step(self, state: ContractState) -> Dict[str, Any]:
+        """Split contract text into individual clauses"""
+        print("🔪 Splitting contract into clauses...")
+        
+        clauses = self.clause_splitter.split_clauses(state.contract_text)
+        
+        if not clauses:
+            raise ValueError("No clauses found in contract text")
+        
+        print(f"✅ Split into {len(clauses)} clauses")
+        return {"clauses": clauses}
 
-        companies = []
-        for tool_name in tool_names:
-            tool_search_results = self.firecrawl.search_companies(tool_name + " official site", num_results=1)
+    def _analyze_clauses_step(self, state: ContractState) -> Dict[str, Any]:
+        """Analyze each clause for summary, risk, and suggestions"""
+        print("🔍 Analyzing clauses...")
+        
+        clause_analyses = []
+        
+        for i, clause in enumerate(state.clauses, 1):
+            print(f"  Analyzing clause {i}/{len(state.clauses)}...")
+            
+            try:
+                analysis = self._analyze_single_clause(clause)
+                clause_analyses.append(analysis)
+            except Exception as e:
+                print(f"    Error analyzing clause {i}: {str(e)}")
+                # Create a fallback analysis
+                clause_analyses.append(ClauseAnalysis(
+                    clause=clause,
+                    summary="Analysis failed",
+                    is_risky=False,
+                    risk_reason="None",
+                    suggestion="None"
+                ))
+        
+        print(f"✅ Completed analysis of {len(clause_analyses)} clauses")
+        return {"clause_analyses": clause_analyses}
 
-            if tool_search_results:
-                result = tool_search_results.data[0]
-                url = result.get("url", "")
-
-                company = CompanyInfo(
-                    name=tool_name,
-                    description=result.get("markdown", ""),
-                    website=url,
-                    tech_stack=[],
-                    competitors=[]
-                )
-
-                scraped = self.firecrawl.scrape_company_pages(url)
-                if scraped:
-                    content = scraped.markdown
-                    analysis = self._analyze_company_content(company.name, content)
-
-                    company.pricing_model = analysis.pricing_model
-                    company.is_open_source = analysis.is_open_source
-                    company.tech_stack = analysis.tech_stack
-                    company.description = analysis.description
-                    company.api_available = analysis.api_available
-                    company.language_support = analysis.language_support
-                    company.integration_capabilities = analysis.integration_capabilities
-
-                companies.append(company)
-
-        return {"companies": companies}
-
-    def _analyze_step(self, state: ResearchState) -> Dict[str, Any]:
-        print("Generating recommendations")
-
-        company_data = ", ".join([
-            company.json() for company in state.companies
-        ])
-
-        messages = [
-            SystemMessage(content=self.prompts.RECOMMENDATIONS_SYSTEM),
-            HumanMessage(content=self.prompts.recommendations_user(state.query, company_data))
+    def _analyze_single_clause(self, clause: str) -> ClauseAnalysis:
+        """Analyze a single clause using LLM"""
+        
+        # Step 1: Generate summary
+        summary_messages = [
+            SystemMessage(content=self.prompts.SUMMARY_SYSTEM),
+            HumanMessage(content=self.prompts.summary_user(clause))
         ]
+        summary_response = self.llm.invoke(summary_messages)
+        summary = summary_response.content.strip()
+        
+        # Step 2: Detect risks
+        risk_messages = [
+            SystemMessage(content=self.prompts.RISK_SYSTEM),
+            HumanMessage(content=self.prompts.risk_user(clause))
+        ]
+        risk_response = self.llm.invoke(risk_messages)
+        
+        # Parse risk analysis
+        try:
+            risk_data = json.loads(risk_response.content)
+            is_risky = risk_data.get("is_risky", False)
+            risk_reason = risk_data.get("risk_reason", "None")
+        except json.JSONDecodeError:
+            # Fallback parsing
+            content = risk_response.content.lower()
+            is_risky = "true" in content and "false" not in content
+            risk_reason = "Analysis failed - manual review recommended"
+        
+        # Step 3: Generate suggestion
+        suggestion_messages = [
+            SystemMessage(content=self.prompts.SUGGESTION_SYSTEM),
+            HumanMessage(content=self.prompts.suggestion_user(clause, is_risky, risk_reason))
+        ]
+        suggestion_response = self.llm.invoke(suggestion_messages)
+        suggestion = suggestion_response.content.strip()
+        
+        return ClauseAnalysis(
+            clause=clause,
+            summary=summary,
+            is_risky=is_risky,
+            risk_reason=risk_reason,
+            suggestion=suggestion
+        )
 
-        response = self.llm.invoke(messages)
-        return {"analysis": response.content}
+    def _generate_report_step(self, state: ContractState) -> Dict[str, Any]:
+        """Generate final summary report"""
+        print("📊 Generating final report...")
+        
+        total_clauses = len(state.clause_analyses)
+        risky_clauses_count = sum(1 for analysis in state.clause_analyses if analysis.is_risky)
+        suggestions_count = sum(1 for analysis in state.clause_analyses if analysis.suggestion != "None")
+        
+        report = ContractReport(
+            total_clauses=total_clauses,
+            risky_clauses_count=risky_clauses_count,
+            suggestions_count=suggestions_count,
+            clauses=state.clause_analyses
+        )
+        
+        print(f"✅ Report generated: {total_clauses} clauses, {risky_clauses_count} risky, {suggestions_count} suggestions")
+        return {"report": report}
 
-    def run(self, query: str) -> ResearchState:
-        initial_state = ResearchState(query=query)
+    def run(self, file_path: str) -> ContractReport:
+        """Run the complete contract analysis workflow"""
+        initial_state = ContractState(file_path=file_path)
         final_state = self.workflow.invoke(initial_state)
-        return ResearchState(**final_state)
+        return final_state["report"]
